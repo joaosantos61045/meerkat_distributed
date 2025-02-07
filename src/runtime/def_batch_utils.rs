@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
-
+use crate::frontend::meerast::Expr;
 use crate::runtime::{
-        message::{Val, TxnAndName, _PropaChange},
-        transaction::Txn,
-        def_eval::compute_val,
-    };
+    eval_expr::evaluate_expr,
+    message::{TxnAndName, Val, _PropaChange},
+    transaction::Txn,
+};
 
 use inline_colorization::*;
 
@@ -63,8 +63,7 @@ pub fn search_batch(
         ) {
             println!("find a batch: {:#?}", batch_acc);
             return batch_acc;
-        } 
-        else {
+        } else {
             visited = HashSet::new();
             batch_acc = HashSet::new();
         }
@@ -72,20 +71,19 @@ pub fn search_batch(
 
     println!("cannot find a batch: {:#?}", batch_acc);
     batch_acc
-    
 }
 
 pub fn apply_batch(
     batch: HashSet<_PropaChange>,
     // worker: &Worker,
     value: &mut Option<Val>,
-    applied_txns: &mut Vec<Txn>,
+    pred_txns: &mut Vec<Txn>,
     prev_batch_provides: &mut HashSet<Txn>,
     propa_changes_to_apply: &mut HashMap<TxnAndName, _PropaChange>,
     replica: &mut HashMap<String, Option<Val>>,
-) -> (HashSet<Txn>, HashSet<Txn>, Option<Val>) {
+    expr: &Expr,
+) -> (HashSet<Txn>, Option<Val>) {
     let mut all_provides: HashSet<Txn> = HashSet::new();
-    let mut all_requires: HashSet<Txn> = prev_batch_provides.clone();
 
     // latest change to prevent applying older updates after younger ones
     // from the same dependency (only apply one dependency's latest update
@@ -94,12 +92,8 @@ pub fn apply_batch(
 
     for change in batch.iter() {
         // change := (value, P, R)
-        let change_txns_toapply = &change.propa_change.provides;
+        let change_txns_toapply = &change.propa_change.preds;
         all_provides = all_provides.union(change_txns_toapply).cloned().collect();
-        all_requires = all_requires
-            .union(&change.propa_change.requires)
-            .cloned()
-            .collect();
 
         for txn in change_txns_toapply.iter() {
             propa_changes_to_apply.remove(&TxnAndName {
@@ -128,19 +122,19 @@ pub fn apply_batch(
         "{color_yellow}replica before compute_val: {:?}{color_reset}",
         replica
     );
-    *value = compute_val(&replica);
+    *value = evaluate_expr(expr,&replica);
     println!(
         "{color_yellow}value after compute_val: {:?}{color_reset}",
         value
     );
     for txn in all_provides.iter() {
-        applied_txns.push(txn.clone());
+        pred_txns.push(txn.clone());
     }
 
     // update prev batch's applied txns, i.e. to be all_provides
     *prev_batch_provides = all_provides.clone();
 
-    return (all_provides, all_requires, value.clone());
+    return (all_provides, value.clone());
 
     // // broadcast the update to subscribers
     // let msg_propa = Message::PropaMessage { propa_change:

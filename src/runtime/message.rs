@@ -1,11 +1,13 @@
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 use crate::{
     frontend::meerast::Expr,
     runtime::{lock::LockKind, transaction::Txn},
 };
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use tokio::sync::mpsc::Sender;
+
+pub const BUFFER_SIZE: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Val {
@@ -22,14 +24,18 @@ pub enum Message {
     },
     UsrReadVarResult {
         var_name: String,
+        var_version: u64,
         result: Option<Val>,
-        result_provides: HashSet<Txn>,
+        result_preds: HashSet<Txn>,
         txn: Txn,
     },
     UsrWriteVarRequest {
         txn: Txn,
         write_val: Val,
-        requires: HashSet<Txn>,
+    },
+    UsrUpdateVarRequest {
+        txn: Txn,
+        update_val: Val,
     },
     UsrReadDefRequest {
         txn: Txn,
@@ -39,13 +45,17 @@ pub enum Message {
         txn: Txn,
         name: String,
         result: Option<Val>,
-        result_provide: HashSet<Txn>,
+        result_pred: HashSet<Txn>,
     },
 
-    DevReadRequest {
-        txn: Txn, 
+    DevReadVarRequest {
+        txn: Txn,
     },
-    DevReadResult { // grant access to Delta(name)
+    DevReadDefRequest {
+        txn: Txn,
+    },
+    DevReadDefResult {
+        // grant access to Delta(name)
         name: String,
         txn: Txn,
     },
@@ -61,9 +71,11 @@ pub enum Message {
     },
     VarLockRelease {
         txn: Txn,
+        requires: HashSet<Txn>,
     },
     VarLockGranted {
         txn: Txn,
+        from_name: String,
     },
     VarLockAbort {
         txn: Txn,
@@ -87,13 +99,34 @@ pub enum Message {
         propa_change: PropaChange, // a small change, make batch valid easier
     },
     Subscribe {
+        subscribe_who: String,
         subscriber_name: String,
         sender_to_subscriber: Sender<Message>,
     },
+    DeSubscribe {
+        // cancel subscription
+        desubscribe_who: String,
+        desubscriber_name: String,
+        // sender_to_subscriber: Sender<Message>,
+    },
     SubscriptionGranted {
-        from_name: String,
+        name: String,
         value: Option<Val>,
         provides: HashSet<Txn>,
+        trans_dep_set: HashSet<String>,
+    },
+    DeSubscriptionGranted {
+        name: String,
+    },
+    DefUpdate {
+        txn: Txn,
+        update_expr: Expr,
+        expr_dependencies: HashMap<String, Option<Val>>,
+    },
+    OnUpdate {
+        txn: Txn,
+        from_name: String,
+        from_value: Option<Val>,
     },
 }
 
@@ -101,8 +134,8 @@ pub enum Message {
 pub struct PropaChange {
     pub from_name: String,
     pub new_val: Val,
-    pub provides: HashSet<Txn>,
-    pub requires: HashSet<Txn>,
+    pub preds: HashSet<Txn>,
+    // pub requires: HashSet<Txn>,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]

@@ -88,7 +88,7 @@ use std::{
 };
 
 use crate::{
-    frontend::meerast::{Binop, Expr},
+    frontend::meerast::Expr,
     runtime::{
         def_batch_utils::{apply_batch, search_batch},
         lock::{Lock, LockKind},
@@ -109,7 +109,6 @@ use super::{
 };
 
 use crate::runtime::manager::Manager;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct PendingCodeUpdate {
@@ -120,8 +119,10 @@ pub struct PendingCodeUpdate {
 
 pub struct DefWorker {
     pub name: String,
-    def_sndr: mpsc::Sender<Message>,
-    def_rcvr: mpsc::Receiver<Message>,
+    pub def_rcvr: Receiver<Message>,
+    pub def_sndr: Sender<Message>,
+    // Anrui: rename it to inbox, as it's created and used by def worker as general
+    // inbox, not only receiving messages from service manager
     pub sender_to_manager: Sender<Message>,
     pub senders_to_subscribers: HashMap<String, Sender<Message>>,
 
@@ -158,16 +159,18 @@ pub struct DefWorker {
 impl DefWorker {
     pub fn new(
         name: &str,
-        sender_to_manager: mpsc::Sender<Message>,
         def_sndr: mpsc::Sender<Message>,
         def_rcvr: mpsc::Receiver<Message>,
+        sender_to_manager: mpsc::Sender<Message>,
         init_expr: &Expr,
+        // replica: HashMap<String, Option<Val>>, // HashMap { dependent name -> None }
         transtitive_deps: HashMap<String, HashSet<String>>,
     ) -> DefWorker {
         DefWorker {
             name: name.to_string(),
             def_sndr,
             def_rcvr,
+
             sender_to_manager,
             senders_to_subscribers: HashMap::new(),
 
@@ -191,10 +194,6 @@ impl DefWorker {
             version: 0,
         }
     }
-
-    // pub fn get_channel(&self) -> (Arc<&mpsc::Sender<Message>>, Arc<&mpsc::Receiver<Message>>) {
-    //     (Arc::new(&self.def_sndr), Arc::new(&self.def_rcvr))
-    // }
 
     pub fn next_count(counter_ref: &mut i32) -> i32 {
         *counter_ref += 1;
@@ -488,86 +487,15 @@ impl DefWorker {
                    deleting no-longer-used subscriptions");
                 */
             }
-            Message::DefUpdate {
-                txn,
-                update_expr,
-                expr_dependencies,
-            } => {
-                // First, check if we have an update lock for this transaction
-                let update_lock_exists = self
-                    .locks
-                    .iter()
-                    .any(|lock| lock.lock_kind == LockKind::Update && lock.txn.id == txn.id);
 
-                if !update_lock_exists {
-                    let _ = self
-                        .sender_to_manager
-                        .send(Message::DefLockAbort { txn: txn.clone() })
-                        .await
-                        .unwrap();
-                    return;
-                }
-
-                // Update replica with new dependency values
-                for (dep_name, dep_value) in expr_dependencies {
-                    if self.replica.contains_key(&dep_name) {
-                        self.replica.insert(dep_name, dep_value);
-                    }
-                }
-
-                // Increment version
-                self.version += 1;
-
-                // Update the expression
-                self.expr = update_expr.clone();
-
-                // Evaluate the new expression
-                let new_value = evaluate_expr(&update_expr, &self.replica);
-                let old_value = self.value.clone();
-                self.value = new_value;
-
-                // Notify all subscribers about the update
-                for (subscriber_name, sender) in &self.senders_to_subscribers {
-                    let update_msg = Message::OnUpdate {
-                        txn: txn.clone(),
-                        from_name: self.name.clone(),
-                        from_value: self.value.clone(),
-                    };
-                    let _ = sender.send(update_msg).await;
-                }
-
-                // Clear any pending writes
-                self.pending_write = None;
-            }
-            Message::OnUpdate {
-                txn,
-                from_name,
-                from_value,
-            } => {
-                // Check if the updated dependency is part of our replica
-                if let Some(current_val) = self.replica.get_mut(&from_name) {
-                    // Update the replica value for this dependency
-                    *current_val = from_value;
-
-                    // Re-evaluate the expression with updated dependencies
-                    let new_value = evaluate_expr(&self.expr, &self.replica);
-
-                    // If the value has changed, update and notify subscribers
-                    if new_value != self.value {
-                        self.value = new_value;
-
-                        // Notify all subscribers about our own update
-                        for (subscriber_name, sender) in &self.senders_to_subscribers {
-                            let update_msg = Message::OnUpdate {
-                                txn: txn.clone(),
-                                from_name: self.name.clone(),
-                                from_value: self.value.clone(),
-                            };
-                            let _ = sender.send(update_msg).await;
-                        }
-                    }
-                }
-            }
+            // for test only
+            // Message::ManagerRetrieve => {
+            //     let msg = Message::ManagerRetrieveResult {
+            //         name: worker.name.clone(),
+            //         result: curr_val.clone(),
+            //     };
+            //     let _ = worker.sender_to_manager.send(msg).await;
+            // }
             _ => panic!(),
         }
     }
@@ -698,17 +626,17 @@ impl DefWorker {
 
 #[tokio::test]
 async fn test_def_update_lock_precedence() {
+    let (def_sndr, mut def_rcvr) = mpsc::channel(BUFFER_SIZE);
     let (manager_sndr, _manager_rcvr) = mpsc::channel(BUFFER_SIZE);
-    let (def_sndr, def_rcvr) = mpsc::channel(BUFFER_SIZE);
 
     let init_expr = Expr::IntConst { val: 0 };
     let transtitive_deps = HashMap::new();
 
     let mut def_worker = DefWorker::new(
         "f",
-        manager_sndr,
         def_sndr,
         def_rcvr,
+        manager_sndr,
         &init_expr,
         transtitive_deps,
     );
@@ -743,9 +671,7 @@ async fn test_def_update_lock_precedence() {
     def_worker.tick().await;
 
     let timeout = std::time::Duration::from_secs(1);
-    // let (def_sndr, def_rcvr) = def_worker.get_channel();
-    // let rcvr = Arc::clone(&def_rcvr);
-    while let Ok(Some(msg)) = tokio::time::timeout(timeout, def_worker.def_rcvr.recv()).await {
+    while let Ok(Some(msg)) = tokio::time::timeout(timeout, def_rcvr.recv()).await {
         match msg {
             Message::DefLockGranted { txn } => {
                 println!("lock granted for update lock {:?}", update_txn.clone());
@@ -758,203 +684,4 @@ async fn test_def_update_lock_precedence() {
             _ => panic!("Unexpected message!"),
         }
     }
-}
-
-// test code update accross nodes such as following scenario:
-    // var a = 0;
-    // var b = 0;
-    // def f = a + b;
-    // def g = f;
-#[tokio::test]
-async fn test_def_worker_update() {
-    use crate::runtime::varworker::VarWorker;
-
-    // Channels for communication
-    let (manager_sndr, _manager_rcvr) = mpsc::channel::<Message>(BUFFER_SIZE);
-    let (var_a_sender, var_a_receiver) = mpsc::channel::<Message>(BUFFER_SIZE);
-    let (var_b_sender, var_b_receiver) = mpsc::channel::<Message>(BUFFER_SIZE);
-    let (def_f_sender, def_f_receiver) = mpsc::channel::<Message>(BUFFER_SIZE);
-    let (def_g_sender, def_g_receiver) = mpsc::channel::<Message>(BUFFER_SIZE);
-
-    // Node relationships and expressions
-    let f_expr = Expr::BopExpr {
-        opd1: Box::new(Expr::IdExpr {
-            ident: "a".to_string(),
-        }),
-        opd2: Box::new(Expr::IdExpr {
-            ident: "b".to_string(),
-        }),
-        bop: Binop::Add,
-    };
-    let g_expr = Expr::IdExpr {
-        ident: "f".to_string(),
-    };
-
-    // Spawn workers
-    let var_a_worker = VarWorker::new(
-        "a", 
-        var_a_receiver, 
-        var_a_sender.clone(), 
-        Some(Val::Int(0))
-    );
-    let var_b_worker = VarWorker::new(
-        "b", 
-        var_b_receiver, 
-        var_b_sender.clone(), 
-        Some(Val::Int(0))
-    );
-    let def_f_worker = DefWorker::new(
-        "f",
-        manager_sndr.clone(),
-        def_f_sender.clone(),
-        def_f_receiver,
-        &f_expr,
-        HashMap::new(),
-    );
-    let def_g_worker = DefWorker::new(
-        "g",
-        manager_sndr.clone(),
-        def_g_sender.clone(),
-        def_g_receiver,
-        &g_expr,
-        HashMap::new(),
-    );
-
-    // Spawn workers
-    tokio::spawn(var_a_worker.run_varworker());
-    tokio::spawn(var_b_worker.run_varworker());
-    tokio::spawn(def_f_worker.run_defworker());
-    tokio::spawn(def_g_worker.run_defworker());
-
-    // Update a to 5
-    let a_update_txn = Txn {
-        id: TxnId::new(),
-        writes: vec![WriteToName {
-            name: "a".to_string(),
-            expr: Expr::IntConst { val: 5 },
-        }],
-    };
-
-    // Request update lock for a
-    let a_update_lock_msg = Message::VarLockRequest {
-        lock_kind: LockKind::Update,
-        txn: a_update_txn.clone(),
-    };
-
-    var_a_sender.send(a_update_lock_msg).await.unwrap();
-
-    // Verify update lock granted for a
-    let (a_lock_sender, mut a_lock_receiver) = mpsc::channel::<Message>(BUFFER_SIZE);
-    tokio::spawn(async move {
-        if let Some(msg) = a_lock_receiver.recv().await {
-            match msg {
-                Message::VarLockGranted { .. } => {}
-                _ => panic!("Unexpected message for a"),
-            }
-        }
-    });
-
-    // Send update value for a
-    let a_update_msg = Message::UsrUpdateVarRequest {
-        txn: a_update_txn.clone(),
-        update_val: Val::Int(5),
-    };
-
-    var_a_sender.send(a_update_msg).await.unwrap();
-
-    // Release update lock for a
-    let a_lock_release_msg = Message::VarLockRelease {
-        txn: a_update_txn.clone(),
-        requires: HashSet::new(),
-    };
-
-    var_a_sender.send(a_lock_release_msg).await.unwrap();
-
-    // Read to verify f and g values
-    let read_txn = Txn {
-        id: TxnId::new(),
-        writes: vec![],
-    };
-
-    let f_read_lock_msg = Message::VarLockRequest {
-        lock_kind: LockKind::Read,
-        txn: read_txn.clone(),
-    };
-    let g_read_lock_msg = Message::VarLockRequest {
-        lock_kind: LockKind::Read,
-        txn: read_txn.clone(),
-    };
-
-    def_f_sender.send(f_read_lock_msg).await.unwrap();
-    def_g_sender.send(g_read_lock_msg).await.unwrap();
-
-    // Verify read locks granted for f and g
-    let (f_lock_sender, mut f_lock_receiver) = mpsc::channel::<Message>(BUFFER_SIZE);
-    let (g_lock_sender, mut g_lock_receiver) = mpsc::channel::<Message>(BUFFER_SIZE);
-    
-    tokio::spawn(async move {
-        if let Some(msg) = f_lock_receiver.recv().await {
-            match msg {
-                Message::VarLockGranted { .. } => {}
-                _ => panic!("Unexpected message for f"),
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        if let Some(msg) = g_lock_receiver.recv().await {
-            match msg {
-                Message::VarLockGranted { .. } => {}
-                _ => panic!("Unexpected message for g"),
-            }
-        }
-    });
-
-    // Send read requests and verify values
-    let f_read_msg = Message::UsrReadVarRequest {
-        txn: read_txn.clone(),
-    };
-    let g_read_msg = Message::UsrReadVarRequest {
-        txn: read_txn.clone(),
-    };
-
-    def_f_sender.send(f_read_msg).await.unwrap();
-    def_g_sender.send(g_read_msg).await.unwrap();
-
-    // Check read results for f and g
-    let (f_result_sender, mut f_result_receiver) = mpsc::channel::<Message>(BUFFER_SIZE);
-    let (g_result_sender, mut g_result_receiver) = mpsc::channel::<Message>(BUFFER_SIZE);
-
-    tokio::spawn(async move {
-        if let Some(msg) = f_result_receiver.recv().await {
-            match msg {
-                Message::UsrReadVarResult {
-                    var_name, result, ..
-                } => {
-                    if var_name == "f" {
-                        assert_eq!(Some(Val::Int(5)), result, "f should be 5");
-                    }
-                }
-                _ => panic!("Unexpected message"),
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        if let Some(msg) = g_result_receiver.recv().await {
-            match msg {
-                Message::UsrReadVarResult {
-                    var_name, result, ..
-                } => {
-                    if var_name == "g" {
-                        assert_eq!(Some(Val::Int(5)), result, "g should be 5");
-                    }
-                }
-                _ => panic!("Unexpected message"),
-            }
-        }
-    });
-
-    // Add a small delay to allow async operations to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 }

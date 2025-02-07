@@ -4,6 +4,7 @@ use crate::runtime::transaction::Txn;
 pub enum LockKind {
     Read,
     Write,
+    Update,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
