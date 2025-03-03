@@ -5,4 +5,5 @@ pub mod lock;
 pub mod manager;
 pub mod message;
 pub mod transaction;
+pub mod repl;
 pub mod varworker;

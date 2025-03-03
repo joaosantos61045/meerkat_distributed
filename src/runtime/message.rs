@@ -1,6 +1,6 @@
 use crate::{
     frontend::meerast::Expr,
-    runtime::{lock::LockKind, transaction::Txn},
+    runtime::{lock::LockKind, transaction::{Txn, TxnId}},
 };
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -112,6 +112,51 @@ pub enum Message {
     DeSubscriptionGranted {
         name: String,
     },
+    DefWorkerUpdate {
+        node: String,
+        expr: Expr,
+    },  
+    DistributedCodeUpdate {
+        code_update: CodeUpdate,
+        txn_id: TxnId,
+        sender_manager_id: String,
+    }, 
+    DistributedCodeUpdateAck {
+        txn_id: TxnId,
+        success: bool,
+        manager_id: String,
+    }, 
+    DistributedSubscribe {
+        remote_node: String,
+        subscriber_node: String,
+        subscriber_sender: Sender<Message>,
+    },      
+    NodeTransfer {
+        node: String,
+        new_manager: String,
+        state: NodeState,
+    },
+}
+ 
+#[derive(Debug, Clone)]
+pub struct CodeUpdate {
+    pub nodes_to_modify: HashSet<String>,
+    pub new_code: Vec<(String, Expr)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeState {
+    pub worker_kind: WorkerKind,
+    pub current_value: Option<Val>,
+    pub dependencies: HashSet<String>,
+    pub version: u64,
+}
+
+//moved from manager.rs
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WorkerKind {
+    Var,
+    Def,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]

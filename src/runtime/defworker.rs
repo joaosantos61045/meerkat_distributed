@@ -237,6 +237,37 @@ impl DefWorker {
 
     pub async fn handle_message(&mut self, msg: Message) {
         match msg {
+            Message::DefWorkerUpdate { node, expr } => {
+                // Unsubscribe from old dependencies
+                let old_deps = self.expr.names_contained();
+                for dep in old_deps {
+                    self.sender_to_manager
+                        .send(Message::DeSubscribe {
+                            desubscribe_who: dep,
+                            desubscriber_name: self.name.clone(),
+                        })
+                        .await
+                        .unwrap();
+                }
+
+                // Update expression and dependencies
+                self.expr = expr.clone();
+                let new_deps = expr.names_contained();
+                self.replica = new_deps.iter().map(|d| (d.clone(), None)).collect();
+
+                // Subscribe to new dependencies 
+                for dep in new_deps {
+                    self.sender_to_manager
+                        .send(Message::Subscribe {
+                            subscribe_who: dep,
+                            subscriber_name: self.name.clone(),
+                            sender_to_subscriber: self.def_sndr.clone(),
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+
             Message::DefLockRequest { 
                 lock_kind, 
                 txn 
@@ -444,20 +475,22 @@ impl DefWorker {
                 search_batch(&self.propa_changes_to_apply, &self.pred_txns);
 
             // apply valid batch
-            println!("{color_yellow}apply batch called{color_reset}");
-            let (all_provides, new_value) = apply_batch(
-                valid_batch,
-                // &def_worker.worker,
-                &mut self.value,
-                &mut self.pred_txns,
-                &mut self.prev_batch_provides,
-                &mut self.propa_changes_to_apply,
-                &mut self.replica,
-                &self.expr,
-            );
+            if !valid_batch.is_empty() {
+                println!("{color_yellow}apply batch called{color_reset}");
+                let (all_provides, new_value) = apply_batch(
+                    valid_batch,
+                    // &def_worker.worker,
+                    &mut self.value,
+                    &mut self.pred_txns,
+                    &mut self.prev_batch_provides,
+                    &mut self.propa_changes_to_apply,
+                    &mut self.replica,
+                    &self.expr,
+                );
+            }
 
-            
-            
+
+
 
             // for test, ack srvmanager
             // if new_value != None {

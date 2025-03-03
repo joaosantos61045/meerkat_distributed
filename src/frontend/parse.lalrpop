@@ -6,6 +6,7 @@ use std::str::FromStr;
 grammar;
 
 pub ReplInput: ReplInput = {
+    <d:Decls> => ReplInput::Decl(d),
     "do" "{" <s:Stmt> "}" => {
         ReplInput::Do(s)
     },

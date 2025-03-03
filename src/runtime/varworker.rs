@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::iter::FromIterator;
 
 use crate::{
     frontend::meerast::Expr,
@@ -83,25 +84,70 @@ impl VarWorker {
     pub async fn handle_message(&mut self, msg: Message) {
         match msg {
             Message::VarLockRequest { lock_kind, txn } => {
-                let this_lock_held = self.locks.contains(&Lock {
-                    lock_kind: lock_kind.clone(),
-                    txn: txn.clone(),
-                });
-                let older_lock_queued = self.lock_queue.iter().any(|x| x.txn.id < txn.id);
-                let one_is_write = lock_kind == LockKind::Write
-                    || self
-                        .lock_queue
-                        .iter()
-                        .any(|x| x.txn.id < txn.id && x.lock_kind == LockKind::Write);
-                println!("{color_yellow}this_lock_held: {this_lock_held}, older_lock_queued: {older_lock_queued}, one_is_write: {one_is_write}{color_reset}");
-                if this_lock_held && older_lock_queued && one_is_write {
-                    let abort_msg = Message::VarLockAbort { txn: txn };
-                    self.sender_to_manager.send(abort_msg).await.unwrap();
-                } else {
-                    self.lock_queue.insert(Lock {
-                        lock_kind: lock_kind,
-                        txn: txn,
-                    });
+                match lock_kind {
+                    LockKind::Upgrade => {
+                        // println!("Received Upgrade Lock Request for txn {:?}", txn.id);
+
+                        // Abort any active read or write locks
+                        let conflicting_txns: Vec<Txn> = self
+                            .locks
+                            .iter()
+                            .filter(|lk| {
+                                lk.lock_kind == LockKind::Read || lk.lock_kind == LockKind::Write
+                            })
+                            .map(|lk| lk.txn.clone())
+                            .collect();
+
+                        for conflict_txn in conflicting_txns {
+                            println!("Aborting conflicting txn {:?}", conflict_txn.id);
+                            let abort_msg = Message::VarLockAbort { txn: conflict_txn };
+                            self.sender_to_manager.send(abort_msg).await.unwrap();
+                        }
+
+                        // Clear all read/write locks and pending requests
+                        self.locks.retain(|lk| lk.lock_kind == LockKind::Upgrade);
+                        self.lock_queue
+                            .retain(|lk| lk.lock_kind == LockKind::Upgrade);
+
+                        // Grant the upgrade lock
+                        self.locks.insert(Lock {
+                            lock_kind: LockKind::Upgrade,
+                            txn: txn.clone(),
+                        });
+
+                        let grant_msg = Message::VarLockGranted {
+                            txn,
+                            from_name: self.name.clone(),
+                        };
+
+                        // println!("Upgrade Lock Granted");
+                        self.sender_to_manager.send(grant_msg).await.unwrap();
+                    }
+
+                    LockKind::Read | LockKind::Write => {
+                        // If an upgrade lock exists or is pending, abort read/write requests
+                        let upgrade_in_granted = self
+                            .locks
+                            .iter()
+                            .any(|lk| lk.lock_kind == LockKind::Upgrade);
+                        let upgrade_in_queue = self
+                            .lock_queue
+                            .iter()
+                            .any(|lk| lk.lock_kind == LockKind::Upgrade);
+
+                        if upgrade_in_granted || upgrade_in_queue {
+                            println!("Read/Write request aborted due to active/pending Upgrade lock for txn {:?}", txn.id);
+                            let abort_msg = Message::VarLockAbort { txn: txn.clone() };
+                            self.sender_to_manager.send(abort_msg).await.unwrap();
+                        } else {
+                            // Queue the read/write request if no conflicts
+                            self.lock_queue.insert(Lock {
+                                lock_kind: lock_kind.clone(),
+                                txn: txn.clone(),
+                            });
+                            println!("Queued {:?} Lock Request for txn {:?}", lock_kind, txn.id);
+                        }
+                    }
                 }
             }
             /* Heng Zhong 9:45 PM
@@ -137,7 +183,7 @@ impl VarWorker {
                 self.locks.retain(|x| x.txn.id != txn.id);
             }
             Message::Subscribe {
-                subscribe_who,
+                subscribe_who: _,
                 subscriber_name,
                 sender_to_subscriber,
             } => {
@@ -160,29 +206,35 @@ impl VarWorker {
                 };
                 let _ = sender_to_subscriber.send(respond_msg).await.unwrap();
             }
+            // If an upgrade lock is active, immediately abort read requests.
             Message::UsrReadVarRequest { txn } => {
-                let mut self_r_locks_held_by_txn: HashSet<Lock> = HashSet::new();
-                for rl in self.locks.iter() {
-                    if rl.lock_kind == LockKind::Read {
-                        if txn.id == rl.txn.id {
-                            self_r_locks_held_by_txn.insert(rl.clone());
-                        }
+                if self
+                    .locks
+                    .iter()
+                    .any(|lk| lk.lock_kind == LockKind::Upgrade)
+                {
+                    let abort_msg = Message::VarLockAbort { txn: txn.clone() };
+                    self.sender_to_manager.send(abort_msg).await.unwrap();
+                } else {
+                    let self_r_locks_held_by_txn: HashSet<Lock> = self
+                        .locks
+                        .iter()
+                        .cloned()
+                        .filter(|lk| lk.lock_kind == LockKind::Read && lk.txn.id == txn.id)
+                        .collect();
+                    self.pred_txns.insert(txn.clone());
+                    let _ = self
+                        .sender_to_manager
+                        .send(Message::UsrReadVarResult {
+                            var_name: self.name.clone(),
+                            result: self.value.clone(),
+                            result_preds: self.pred_txns.clone(),
+                            txn: txn.clone(),
+                        })
+                        .await;
+                    for rl in self_r_locks_held_by_txn.into_iter() {
+                        self.locks.remove(&rl);
                     }
-                }
-                // now txn's read has been applied
-                self.pred_txns.insert(txn.clone());
-
-                let _ = self
-                    .sender_to_manager
-                    .send(Message::UsrReadVarResult {
-                        var_name: self.name.clone(),
-                        result: self.value.clone(),
-                        result_preds: self.pred_txns.clone(),
-                        txn: txn,
-                    })
-                    .await;
-                for rl in self_r_locks_held_by_txn.into_iter() {
-                    self.locks.remove(&rl);
                 }
             }
             /* Initially, and when there is no current write txn, current_value is the

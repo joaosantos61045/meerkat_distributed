@@ -2,12 +2,13 @@ use crate::{
     frontend::{meerast::Expr, typecheck::Type},
     runtime::{
         eval_expr,
-        lock::{Lock, LockKind},
-        message::{self, Message, Val},
+        lock::{Lock, LockKind, LockType, LockWorkerInfo},
+        message::{self, Message, Val, WorkerKind, CodeUpdate},
         transaction::{Txn, TxnId, WriteToName},
     },
 };
 
+use std::fmt;
 use inline_colorization::*;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -15,23 +16,31 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use super::{defworker::DefWorker, message::BUFFER_SIZE, varworker::VarWorker};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum WorkerKind {
-    Var,
-    Def,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LockWorkerInfo {
-    pub lock: Lock,
-    pub worker_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValTxnInfo {
     pub val: Val,
     pub txn_id: TxnId,
 }
 
+#[derive(Debug, Clone)]
+pub enum ManagerError {
+    WorkerUnavailable(String),
+    CyclicDependency(String),
+    LockConflict(String),
+    DistributedError(String),
+}
+
+impl fmt::Display for ManagerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ManagerError::WorkerUnavailable(name) => write!(f, "Worker unavailable: {}", name),
+            ManagerError::CyclicDependency(cycle) => write!(f, "Cyclic dependency: {}", cycle),
+            ManagerError::LockConflict(msg) => write!(f, "Lock conflict: {}", msg),
+            ManagerError::DistributedError(msg) => write!(f, "Distributed error: {}", msg),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Manager {
     // cloned and given to new workers when creating them
     pub sender_to_manager: Sender<Message>,
@@ -44,6 +53,16 @@ pub struct Manager {
     // { name |-> { subscribers } }
     pub dependency_graph: HashMap<String, HashSet<String>>,
     pub most_recently_applied_txn: Option<Txn>,
+    pub system_configuration: HashMap<String, Expr>,
+    pub reverse_dependencies: HashMap<String, HashSet<String>>,
+    pub node_locks: HashMap<String, Vec<LockType>>,
+    pub active_transactions: HashMap<TxnId, HashSet<String>>,
+    pub transaction_values: HashMap<String, Val>,
+    pub subscript_versions: HashMap<String, u64>, 
+    pub manager_id: Option<String>,
+    pub managed_nodes: HashSet<String>, //which nodes this manager handles 
+    pub peer_managers: HashMap<String, Sender<Message>>,
+    pub node_manager_map: HashMap<String, String>, // Mapping from node names to the manager ID that owns them.
 }
 
 impl Manager {
@@ -58,9 +77,506 @@ impl Manager {
             txn_locks_map: HashMap::new(),
             dependency_graph: HashMap::new(),
             most_recently_applied_txn: None,
+            system_configuration: HashMap::new(),
+            reverse_dependencies: HashMap::new(),
+            node_locks: HashMap::new(),
+            active_transactions: HashMap::new(),
+            transaction_values: HashMap::new(),
+            subscript_versions: HashMap::new(),
+            manager_id: None,
+            managed_nodes: HashSet::new(),
+            peer_managers: HashMap::new(),
+            node_manager_map: HashMap::new(),
         }
     }
 
+    /// Looks up the manager for a given node.
+    /// Returns an error if the node is local or no remote manager is known.
+    fn get_manager_for_node(&self, node: &str) -> Result<String, ManagerError> {
+        if self.managed_nodes.contains(node) {
+            Err(ManagerError::DistributedError(format!("Node {} is local", node)))
+        } else {
+            self.node_manager_map.get(node)
+                .cloned()
+                .ok_or_else(|| ManagerError::DistributedError(format!("Manager for node {} not found", node)))
+        }
+    }
+
+    pub async fn acquire_upgrade_lock(
+        &mut self,
+        node: &str,
+        txn_id: TxnId,
+    ) -> Result<(), ManagerError> {
+        // Initialize worker if it doesn't exist
+        if !self.senders_to_workers.contains_key(node) {
+            self.create_varworker(node).await;
+        }
+    
+        // Initialize locks vector if it doesn't exist
+        self.node_locks.entry(node.to_string()).or_default();
+    
+        // First check if we already have the upgrade lock
+        {
+            let locks = self.node_locks.get(node).unwrap();
+            if locks
+                .iter()
+                .any(|lock| matches!(lock, LockType::Upgrade(id) if *id == txn_id))
+            {
+                return Ok(());
+            }
+        }
+    
+        // Collect transactions to abort
+        let txns_to_abort: Vec<TxnId> = {
+            let locks = self.node_locks.get(node).unwrap();
+            locks
+                .iter()
+                .filter_map(|lock| match lock {
+                    LockType::Read(id) | LockType::Write(id) | LockType::Upgrade(id) => {
+                        Some(id.clone())
+                    }
+                })
+                .collect()
+        };
+    
+        // Abort all existing transactions
+        for txn in txns_to_abort {
+            self.abort_transaction(&txn)?;
+        }
+    
+        // Clear existing locks before requesting new one
+        if let Some(locks) = self.node_locks.get_mut(node) {
+            locks.clear();
+        }
+    
+        // Send upgrade lock request to worker
+        let sender = self.senders_to_workers.get(node).unwrap().clone();
+        let txn = Txn {
+            id: txn_id.clone(),
+            writes: vec![],
+        };
+    
+        let lock_req_msg = Message::VarLockRequest {
+            lock_kind: LockKind::Upgrade,
+            txn: txn.clone(),
+        };
+        
+        sender
+            .send(lock_req_msg)
+            .await
+            .map_err(|_| ManagerError::WorkerUnavailable(node.to_string()))?;
+    
+        // Wait for response
+        match self.receiver_from_workers.recv().await {
+            Some(Message::VarLockGranted {
+                txn: resp_txn,
+                from_name,
+            }) => {
+                if resp_txn.id != txn_id {
+                    return Err(ManagerError::LockConflict(format!(
+                        "Received response for wrong transaction ID"
+                    )));
+                }
+                assert_eq!(from_name, node);
+    
+                // Update lock tracking
+                self.txn_locks_map
+                    .entry(txn_id.clone())
+                    .or_default()
+                    .insert(LockWorkerInfo {
+                        lock: Lock {
+                            lock_kind: LockKind::Upgrade,
+                            txn: txn.clone(),
+                        },
+                        worker_name: from_name,
+                    });
+    
+                // Add upgrade lock to node
+                self.node_locks
+                    .get_mut(node)
+                    .unwrap()
+                    .push(LockType::Upgrade(txn_id));
+    
+                Ok(())
+            }
+            Some(Message::VarLockAbort { txn: resp_txn }) => {
+                assert_eq!(resp_txn.id, txn_id);
+                Err(ManagerError::LockConflict(format!(
+                    "Failed to acquire upgrade lock on node {}",
+                    node
+                )))
+            }
+            _ => Err(ManagerError::WorkerUnavailable(node.to_string())),
+        }
+    } 
+
+    fn abort_transaction(&mut self, txn_id: &TxnId) -> Result<(), ManagerError> {
+        if let Some(nodes) = self.active_transactions.remove(txn_id) {
+            for node in nodes {
+                if let Some(locks) = self.node_locks.get_mut(&node) {
+                    locks.retain(|lock| match lock {
+                        LockType::Read(id) | LockType::Write(id) => id != txn_id,
+                        _ => true,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn translate_to_versioned_form(
+        &mut self,
+        update: &[(String, Expr)],
+    ) -> Result<Vec<(String, Expr)>, ManagerError> {
+        let mut versioned_updates = Vec::new();
+        for (name, expr) in update {
+            // Increment the version for this node
+            let version = self.subscript_versions.entry(name.clone()).or_insert(0);
+            let versioned_name = format!("{}{}", name, version);
+            *version += 1;
+
+            // Update the expression to use versioned dependencies
+            let versioned_expr = self.version_expr(expr);
+
+            versioned_updates.push((versioned_name, versioned_expr));
+        }
+        Ok(versioned_updates)
+    }
+
+    fn version_expr(&self, expr: &Expr) -> Expr {
+        match expr {
+            Expr::IdExpr { ident } => {
+                let version = self.subscript_versions.get(ident).unwrap_or(&0).saturating_sub(1);
+                Expr::IdExpr {
+                    ident: format!("{}{}", ident, version),
+                }
+            }
+            Expr::BopExpr { opd1, opd2, bop } => Expr::BopExpr {
+                opd1: Box::new(self.version_expr(opd1)),
+                opd2: Box::new(self.version_expr(opd2)),
+                bop: bop.clone(),
+            },
+            _ => expr.clone(),
+        }
+    }
+
+    // detect cycles in the dependency graph
+    fn detect_cycles(&self, updates: &[(String, Expr)]) -> Result<(), ManagerError> {
+        // Create a temporary graph that includes both existing and new dependencies
+        let mut temp_graph: HashMap<String, HashSet<String>> = self.dependency_graph.clone();
+        
+        // Track which manager owns each node
+        let mut node_ownership: HashMap<String, Option<String>> = HashMap::new();
+        
+        // Initialize ownership for existing nodes
+        for (node, _) in &temp_graph {
+            if self.managed_nodes.contains(node) {
+                node_ownership.insert(node.clone(), Some(self.manager_id.clone().unwrap_or_default()));
+            } else if let Some(manager_id) = self.node_manager_map.get(node) {
+                node_ownership.insert(node.clone(), Some(manager_id.clone()));
+            } else {
+                node_ownership.insert(node.clone(), None);
+            }
+        }
+    
+        // Add new dependencies from the updates
+        for (name, expr) in updates {
+            let deps = expr.names_contained();
+            temp_graph.insert(name.clone(), deps.clone());
+            
+            // Track ownership of new nodes
+            if self.managed_nodes.contains(name) {
+                node_ownership.insert(name.clone(), Some(self.manager_id.clone().unwrap_or_default()));
+            }
+            
+            for dep in &deps {
+                if !node_ownership.contains_key(dep) {
+                    if self.managed_nodes.contains(dep) {
+                        node_ownership.insert(dep.clone(), Some(self.manager_id.clone().unwrap_or_default()));
+                    } else if let Some(manager_id) = self.node_manager_map.get(dep) {
+                        node_ownership.insert(dep.clone(), Some(manager_id.clone()));
+                    } else {
+                        node_ownership.insert(dep.clone(), None);
+                    }
+                }
+            }
+        }
+    
+        // Helper function for DFS cycle detection
+        fn has_cycle(
+            graph: &HashMap<String, HashSet<String>>,
+            node: &str,
+            visited: &mut HashSet<String>,
+            path: &mut HashSet<String>,
+            node_ownership: &HashMap<String, Option<String>>,
+            cycle_start: &mut Option<String>,
+        ) -> Option<Vec<(String, Option<String>)>> {
+            if path.contains(node) {
+                *cycle_start = Some(node.to_string());
+                return Some(vec![(node.to_string(), node_ownership.get(node).cloned().flatten())]);
+            }
+    
+            if visited.contains(node) {
+                return None;
+            }
+    
+            path.insert(node.to_string());
+    
+            if let Some(deps) = graph.get(node) {
+                for dep in deps {
+                    if let Some(mut cycle) = has_cycle(graph, dep, visited, path, node_ownership, cycle_start) {
+                        // Only add nodes until we complete the cycle
+                        if let Some(ref start) = *cycle_start {
+                            if node == start {
+                                *cycle_start = None;
+                            } else {
+                                cycle.push((node.to_string(), node_ownership.get(node).cloned().flatten()));
+                            }
+                        }
+                        return Some(cycle);
+                    }
+                }
+            }
+            // Remove node from current path (but leave it in visited)
+            path.remove(node);
+            visited.insert(node.to_string());
+            None
+        }
+    
+        // Check each node for cycles
+        let mut visited = HashSet::new();
+        let mut path = HashSet::new();
+        let current_manager = self.manager_id.clone().unwrap_or_default();
+    
+        for node in temp_graph.keys() {
+            let mut cycle_start = None;
+            if let Some(cycle) = has_cycle(
+                &temp_graph, 
+                node, 
+                &mut visited, 
+                &mut path, 
+                &node_ownership,
+                &mut cycle_start,
+            ) {
+                // Collect managers involved in the cycle
+                let managers: HashSet<String> = cycle.iter()
+                    .filter_map(|(_, manager)| manager.clone())
+                    .collect();
+    
+                // Only include manager information if there's more than one manager
+                let cycle_str = cycle.into_iter().map(|(node, manager)| {
+                    if managers.len() > 1 {
+                        if let Some(mgr) = manager {
+                            if mgr == current_manager {
+                                format!("{} (local)", node)
+                            } else {
+                                format!("{} (manager: {})", node, mgr)
+                            }
+                        } else {
+                            format!("{} (unknown manager)", node)
+                        }
+                    } else {
+                        node
+                    }
+                }).collect::<Vec<_>>().join(" → ");
+    
+                let error_msg = if managers.len() > 1 {
+                    format!(
+                        "Cross-manager cyclic dependency detected across managers [{}]: {}",
+                        managers.into_iter().collect::<Vec<_>>().join(", "),
+                        cycle_str
+                    )
+                } else {
+                    format!("Cyclic dependency detected: {}", cycle_str)
+                };
+    
+                return Err(ManagerError::CyclicDependency(error_msg));
+            }
+        }
+    
+        Ok(())
+    }
+
+    pub async fn apply_code_update(&mut self, update: CodeUpdate, txn_id: &TxnId) -> Result<(), ManagerError> {  
+        for node in update.nodes_to_modify.iter() {
+            self.acquire_upgrade_lock(node, txn_id.clone()).await;
+       }   
+        // Translate to versioned form, incrementing versions
+        let qualified_updates = self.translate_to_versioned_form(&update.new_code)?;
+
+        // Remove old versions from all relevant data structures
+        for base_name in &update.nodes_to_modify {
+            let keys_to_remove: Vec<String> = self.system_configuration.keys()
+                .filter(|k| k.starts_with(base_name))
+                .cloned()
+                .collect();
+            
+            for key in keys_to_remove {
+                self.system_configuration.remove(&key);
+                self.dependency_graph.remove(&key);
+                for rev_deps in self.reverse_dependencies.values_mut() {
+                    rev_deps.remove(&key);
+                }
+            }
+        }
+
+        // Add new versions with updated dependencies
+        for (versioned_name, expr) in qualified_updates {
+            let deps = expr.names_contained();
+            self.system_configuration
+                .insert(versioned_name.clone(), expr.clone());
+            self.dependency_graph
+                .insert(versioned_name.clone(), deps.clone());
+
+            for dep in deps.clone() { 
+                self.reverse_dependencies
+                .entry(dep)
+                .or_default()
+                .insert(versioned_name.clone());
+            }
+
+            // Create workers as needed
+            if deps.is_empty() {
+                self.create_varworker(&versioned_name.clone()).await;
+            } else {
+                let transitive_deps = self.dependency_graph.clone();
+                self.create_defworker(&versioned_name, &expr, transitive_deps)
+                    .await;
+            }
+        } 
+        Ok(())
+    }
+
+    /// This partitions an update into local and remote parts,
+    /// sends remote updates via peer_managers, and waits for acknowledgements.
+    pub async fn handle_code_update(&mut self, update: CodeUpdate) -> Result<(), ManagerError> {
+        let txn_id = TxnId::new();
+    
+        if let Err(e) = self.detect_cycles(&update.new_code) { 
+            return Err(e);
+        }
+    
+        let mut local_update = CodeUpdate {
+            nodes_to_modify: HashSet::new(),
+            new_code: Vec::new(),
+        };
+        let mut remote_updates: HashMap<String, CodeUpdate> = HashMap::new();
+    
+        for node in update.nodes_to_modify.iter() {
+            if self.managed_nodes.contains(node) {
+                local_update.nodes_to_modify.insert(node.clone());
+            } else {
+                match self.get_manager_for_node(node) {
+                    Ok(manager_id) => { 
+                        remote_updates
+                            .entry(manager_id)
+                            .or_insert(CodeUpdate { nodes_to_modify: HashSet::new(), new_code: Vec::new() })
+                            .nodes_to_modify
+                            .insert(node.clone());
+                    }
+                    Err(e) => { 
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    
+        for (node, expr) in update.new_code.into_iter() {
+            if self.managed_nodes.contains(&node) {
+                local_update.new_code.push((node, expr));
+            } else {
+                match self.get_manager_for_node(&node) {
+                    Ok(manager_id) => {
+                        remote_updates
+                            .entry(manager_id)
+                            .or_insert(CodeUpdate { nodes_to_modify: HashSet::new(), new_code: Vec::new() })
+                            .new_code
+                            .push((node, expr));
+                    }
+                    Err(e) => { 
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        for (manager_id, remote_update) in &remote_updates {
+            if let Some(peer_sender) = self.peer_managers.get(manager_id) { 
+                let send_result = peer_sender
+                    .send(Message::DistributedCodeUpdate {
+                        code_update: remote_update.clone(),
+                        txn_id: txn_id.clone(),
+                        sender_manager_id: self.manager_id.clone().unwrap_or_default(), // Added
+                    })
+                    .await;
+                if let Err(e) = send_result { 
+                    return Err(ManagerError::DistributedError(
+                        format!("Failed to send update to manager {}: {:?}", manager_id, e)
+                    ));
+                }
+            } else {
+                return Err(ManagerError::DistributedError(
+                    format!("Peer manager {} not found", manager_id)
+                ));
+            }
+            }
+        
+        self.apply_code_update(local_update, &txn_id).await?; 
+    
+        let mut acks_received = 0;
+        let expected_acks = remote_updates.len();
+    
+        while acks_received < expected_acks {
+            if let Some(msg) = self.receiver_from_workers.recv().await {
+                if let Message::DistributedCodeUpdateAck { txn_id: ack_txn, success, manager_id } = msg {
+                    if ack_txn == txn_id {
+                        if !success {
+                            return Err(ManagerError::DistributedError(
+                                format!("Update failed at manager {}", manager_id)
+                            ));
+                        }
+                        acks_received += 1; 
+                    }
+                }
+            }
+        } 
+
+        // Release upgrade locks immediately after applying updates
+        for node in &update.nodes_to_modify {
+            if let Some(locks) = self.node_locks.get_mut(node) {
+                locks.retain(|lock| !matches!(lock, LockType::Upgrade(id) if id == &txn_id));
+            }
+        }
+        Ok(())
+
+    }       
+
+    pub async fn handle_message(&mut self, msg: Message) -> Result<(), ManagerError> {
+        match msg {
+            Message::DistributedCodeUpdate { code_update, txn_id, sender_manager_id } => {
+                let update_result = self.apply_code_update(code_update, &txn_id).await;
+    
+                // Send acknowledgment via the peer channel back to the sender
+                if let Some(peer_sender) = self.peer_managers.get(&sender_manager_id) {
+                    let ack_msg = Message::DistributedCodeUpdateAck {
+                        txn_id,
+                        success: update_result.is_ok(),
+                        manager_id: self.manager_id.clone().unwrap_or_default(),
+                    };
+                    peer_sender.send(ack_msg).await.map_err(|e| {
+                        ManagerError::DistributedError(format!("Failed to send ack: {}", e))
+                    })?;
+                } else {
+                    return Err(ManagerError::DistributedError(
+                        format!("Peer manager {} not found", sender_manager_id)
+                    ));
+                } 
+            }
+            _ => { }
+        }
+        Ok(())
+    }       
+    
     pub async fn handle_transaction(&mut self, txn: &Txn) {
         let mut names_read_by_txn = HashSet::new();
         let mut names_written_by_txn = HashSet::new();
@@ -297,6 +813,7 @@ require read locks, but really?{color_reset}"
         // TODO. Added for testing. Does this suffice for updating the worker kind environment?
         self.worker_kind_env
             .insert(name.to_string(), WorkerKind::Var);
+        self.managed_nodes.insert(name.to_string());
         tokio::spawn(var_worker.run_varworker());
     }
 
@@ -316,10 +833,75 @@ require read locks, but really?{color_reset}"
             init_expr,
             transitive_deps,
         );
-        self.senders_to_workers.insert(name.to_string(), defs_sndr);
+        self.senders_to_workers.insert(name.to_string(), defs_sndr.clone());
+        self.worker_kind_env.insert(name.to_string(), WorkerKind::Def);
+        self.managed_nodes.insert(name.to_string());
+
+        // Update ownership mapping: record when this manager owns the node.
+        if let Some(my_id) = &self.manager_id {
+            self.node_manager_map.insert(name.to_string(), my_id.clone());
+        }
+
+        // Immediately subscribe to dependencies 
+        let deps = init_expr.names_contained();
+        for dep in deps {
+            if self.managed_nodes.contains(&dep) {
+                let _ = defs_sndr
+                    .send(Message::Subscribe {
+                        subscribe_who: dep,
+                        subscriber_name: name.to_string(),
+                        sender_to_subscriber: defs_sndr.clone(),
+                    })
+                    .await;
+            } else if let Some(manager_id) = self.node_manager_map.get(&dep) {
+                if let Some(peer_sender) = self.peer_managers.get(manager_id) {
+                    let _ = peer_sender
+                        .send(Message::DistributedSubscribe {
+                            remote_node: dep,
+                            subscriber_node: name.to_string(),
+                            subscriber_sender: defs_sndr.clone(),
+                        })
+                        .await;
+                }
+            } else {
+                // Fallback if no remote mapping is found.
+                let _ = defs_sndr
+                    .send(Message::Subscribe {
+                        subscribe_who: dep,
+                        subscriber_name: name.to_string(),
+                        sender_to_subscriber: defs_sndr.clone(),
+                    })
+                    .await;
+            }
+        }
+
+
         tokio::spawn(def_worker.run_defworker());
     }
 
     // Do we really need the instruction `close(txn_id)`?
     // Yes! Because need to remember {txn |-> lock_info set}
+
+    pub fn retrieve_val(&self, name: &str) -> Option<Val> {
+        let base_name = name.trim_end_matches(|c: char| c.is_numeric());
+        let version = self.subscript_versions.get(base_name).unwrap_or(&0).saturating_sub(1); 
+        let versioned_name = format!("{}{}", base_name, version);
+
+        if let Some(expr) = self.system_configuration.get(&versioned_name) {
+            let mut val_env = HashMap::new();
+
+            // Recursively get values for dependencies
+            for dep in expr.names_contained() {
+                if let Some(dep_val) = self.retrieve_val(&dep) {
+                    val_env.insert(dep.clone(), Some(dep_val));
+                } else {
+                    return None;
+                }
+            }
+
+            eval_expr::evaluate_expr(expr, &val_env)
+        } else {
+            None
+        }
+    }
 }
