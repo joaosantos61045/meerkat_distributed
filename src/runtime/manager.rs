@@ -12,7 +12,7 @@ use std::fmt;
 use inline_colorization::*;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-
+use tokio::io::AsyncWriteExt;
 use super::{defworker::DefWorker, message::BUFFER_SIZE, varworker::VarWorker};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -96,11 +96,14 @@ impl Manager {
         node: &str,
         txn_id: TxnId,
     ) -> Result<(), ManagerError> {
+        let mut stdout = tokio::io::stdout();
         // Initialize worker if it doesn't exist
+        
         if !self.senders_to_workers.contains_key(node) {
             self.create_varworker(node).await;
         }
-
+       
+        
         // Initialize locks vector if it doesn't exist
         self.node_locks.entry(node.to_string()).or_default();
 
@@ -314,7 +317,7 @@ impl Manager {
         for node in &update.nodes_to_modify {
             self.acquire_upgrade_lock(node, txn_id.clone()).await?;
         }
-
+        
         // Translate to versioned form, incrementing versions
         let qualified_updates = self.translate_to_versioned_form(&update.new_code)?;
        
@@ -333,7 +336,7 @@ impl Manager {
                 }
             }
         }
-
+       
         // // Increment version numbers for modified nodes
         // for node in &update.nodes_to_modify {
         //     self.subscript_versions
@@ -357,14 +360,14 @@ impl Manager {
                     .insert(versioned_name.clone());
             }
         }
-
+        
         // Release upgrade locks immediately after applying updates
         for node in &update.nodes_to_modify {
             if let Some(locks) = self.node_locks.get_mut(node) {
                 locks.retain(|lock| !matches!(lock, LockType::Upgrade(id) if id == &txn_id));
             }
         }
-
+       
         Ok(())
     }
 
@@ -599,11 +602,14 @@ require read locks, but really?{color_reset}"
         // the channel send from manager to worker
         let (sndr_from_manager, rcvr_from_manager) = mpsc::channel(BUFFER_SIZE);
         let var_worker = VarWorker::new(name, rcvr_from_manager, self.sender_to_manager.clone());
+        
         self.senders_to_workers
             .insert(name.to_string(), sndr_from_manager);
         // TODO. Added for testing. Does this suffice for updating the worker kind environment?
+        if !self.worker_kind_env.contains_key(name) {
         self.worker_kind_env
             .insert(name.to_string(), WorkerKind::Var);
+        }
         tokio::spawn(var_worker.run_varworker());
     }
 
@@ -637,7 +643,7 @@ require read locks, but really?{color_reset}"
 
         if let Some(expr) = self.system_configuration.get(&versioned_name) {
             let mut val_env = HashMap::new();
-
+            
             // Recursively get values for dependencies
             for dep in expr.names_contained() {
                 if let Some(dep_val) = self.retrieve_val(&dep) {
