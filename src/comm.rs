@@ -119,6 +119,7 @@ impl Communication {
         let mut pub_access: HashMap<String, bool> = HashMap::new();
         let mut gen_fresh_meta = FreshMetaGenerator::new("default", 0);
         let mut gen_fresh_tyvar = FreshTyvarGenerator::new("default", 0);
+        let man = &mut self.manager;
         loop {
             tokio::select! {
                 Some(listener_msg) = rcvr.recv() => {
@@ -150,35 +151,7 @@ impl Communication {
                                                 };
                                                 let error_json = serde_json::to_string(&error_msg).unwrap();
                                                 stream.send(Message::Text(error_json)).await.unwrap();
-                                                let mut curr_val_env: HashMap<String, String> = HashMap::new();
-                                                // Current Env msg
-                                                let env_message = "Current Environment:".to_string();
-                                                let env_json = serde_json::to_string(&env_message).unwrap();
-                                                stream.send(Message::Text(env_json)).await.unwrap();
-                                                // Collect environment values into a HashMap
-                                                for (name, _) in self.manager.system_configuration.iter() { 
-                                                    let val_of_name = Manager::retrieve_val(&self.manager, name);
-                                                    let val_str = match val_of_name {
-                                                        Some(Val::Int(val)) => format!("Int({})", val),
-                                                        Some(Val::Bool(val)) => format!("Bool({})", val),
-                                                        Some(Val::Action(expr)) => format!("Action({:?})", expr),
-                                                        Some(Val::Lambda(expr)) => format!("Lambda({:?})", expr),
-                                                        None => "None".to_string(),
-                                                    };
-                                                    curr_val_env.insert(name.clone(), val_str);
-                                                }
-                                        
-                                                // Create response message
-                                                let reply_msg = Server2ClientMsg {
-                                                    env: serde_json::to_string(&curr_val_env).unwrap(),
-                                                    err: None,
-                                                };
-                                        
-                                                // Serialize to JSON
-                                                let reply_json = serde_json::to_string(&reply_msg).unwrap();
-                                        
-                                                // Send message to client over WebSocket
-                                                stream.send(Message::Text(reply_json)).await.unwrap();
+                                                Communication::send_environment_info(&mut *stream, man).await;
                                                 continue; 
                                             }
                                         };
@@ -212,11 +185,11 @@ impl Communication {
                                                                         new_code: vec![(name.clone(), val.clone())],
                                                                     };
                             
-                                                                    self.manager
+                                                                    man
                                                                         .worker_kind_env
                                                                         .insert(name.clone(), WorkerKind::Var);
                                                                     
-                                                                    if let Err(e) = self.manager.handle_code_update(code_update).await {
+                                                                    if let Err(e) = man.handle_code_update(code_update).await {
                                                                         let _ = stdout
                                                                             .write_all(format!("\x1b[31m{}\x1b[0m\n", e).as_bytes())
                                                                             .await;
@@ -232,12 +205,12 @@ impl Communication {
                                                                         new_code: vec![(name.clone(), val.clone())],
                                                                     };
                                                                   
-                                                                    self.manager
+                                                                    man
                                                                         .worker_kind_env
                                                                         .insert(name.clone(), WorkerKind::Def);
                                                                     
                                                                    
-                                                                    if let Err(e) = self.manager.handle_code_update(code_update).await {
+                                                                    if let Err(e) = man.handle_code_update(code_update).await {
                                                                         let _ = stdout
                                                                             .write_all(format!("\x1b[31m{}\x1b[0m\n", e).as_bytes())
                                                                             .await;
@@ -281,12 +254,13 @@ impl Communication {
                                                                             expr: src,
                                                                         }],
                                                                     };
-                                                                    // if let Err(e) = manager.handle_transaction(&txn).await {
-                                                                    //     let _ = stdout
-                                                                    //         .write_all(format!("\x1b[31mTransaction error: {}\x1b[0m\n", e).as_bytes())
-                                                                    //         .await;
-                                                                    //     continue;
-                                                                    // }
+                                                                    
+                                                                     /*if let Err(e) = self.manager.handle_transaction(&txn).await {
+                                                                         let _ = stdout
+                                                                             .write_all(format!("\x1b[31mTransaction error: {}\x1b[0m\n", e).as_bytes())
+                                                                             .await;
+                                                                        continue;
+                                                                     }*/
                                                                 }
                                                                 _ => {
                                                                     let _ = stdout
@@ -303,58 +277,7 @@ impl Communication {
                                         }
                                        
             
-                                        let mut curr_val_env: HashMap<String, String> = HashMap::new();
-                                        // Current Env msg
-                                       /*  let env_message = Server2ClientMsg {
-                                            env: "Current Environment:".to_string(),
-                                            err: None,
-                                        };*/
-                                        let env_message = "Current Environment:".to_string();
-                                        
-                                       
-                                       
-                                        let env_json = serde_json::to_string(&env_message).unwrap();
-                                        stream.send(Message::Text(env_json)).await.unwrap();
-                                        // Collect environment values into a HashMap
-                                        for (name, _) in self.manager.system_configuration.iter() { 
-                                            let val_of_name = Manager::retrieve_val(&self.manager, name);
-                                            let val_str = match val_of_name {
-                                                Some(Val::Int(val)) => format!("Int({})", val),
-                                                Some(Val::Bool(val)) => format!("Bool({})", val),
-                                                Some(Val::Action(expr)) => format!("Action({:?})", expr),
-                                                Some(Val::Lambda(expr)) => format!("Lambda({:?})", expr),
-                                                None => "None".to_string(),
-                                            };
-                                            let expr = self.manager.system_configuration.get(name.as_str());
-                                            let def_str = match expr {
-                                                Some(e) => Communication::expr_to_string(e),
-                                                None => "N/A".to_string(),
-                                            };
-                                           let regex = regex::Regex::new(r"\d+$").unwrap();
-                                           let stripped_name = regex.replace(&name, "").to_string();
-                                           let type_var = self.manager.worker_kind_env.get(&stripped_name);
-                                           let kind_str = match type_var {
-                                            Some(kind) => format!("{:?}", kind),
-                                            None => "Unknown".to_string(),
-                                            };
-                                            curr_val_env.insert(
-                                                name.clone(),
-                                                format!("{}-{}-{}", val_str, kind_str, def_str)
-                                            );
-                                        
-                                        }
-                                       
-                                        // Create response message
-                                        let reply_msg = Server2ClientMsg {
-                                            env: serde_json::to_string(&curr_val_env).unwrap(),
-                                            err: None,
-                                        };
-                                
-                                        // Serialize to JSON
-                                        let reply_json = serde_json::to_string(&reply_msg).unwrap();
-                                
-                                        // Send message to client over WebSocket
-                                        stream.send(Message::Text(reply_json)).await.unwrap();
+                                        Communication::send_environment_info(&mut *stream, man).await;
                                     }
                                     Some(Ok(_)) => {
                                         println!("Received non-text message from client {id}");
@@ -385,7 +308,60 @@ impl Communication {
             }
         }
     }
-
+    async fn send_environment_info(
+        stream:  &mut WebSocketStream<tokio::net::TcpStream>,
+        man: &Manager,
+    ) {
+        let mut curr_val_env: HashMap<String, String> = HashMap::new();
+        let env_message = "Current Environment:".to_string();
+        let env_json = serde_json::to_string(&env_message).unwrap();
+    
+        // Send the environment message
+        stream.send(Message::Text(env_json)).await.unwrap();
+    
+        // Collect environment values into a HashMap
+        for (name, _) in man.system_configuration.iter() {
+            let val_of_name = Manager::retrieve_val(man, name); // No changes needed here
+            let val_str = match val_of_name {
+                Some(Val::Int(val)) => format!("Int({})", val),
+                Some(Val::Bool(val)) => format!("Bool({})", val),
+                Some(Val::Action(expr)) => format!("Action({:?})", expr),
+                Some(Val::Lambda(expr)) => format!("Lambda({:?})", expr),
+                None => "None".to_string(),
+            };
+    
+            let expr = man.system_configuration.get(name.as_str());
+            let def_str = match expr {
+                Some(e) => Communication::expr_to_string(e),
+                None => "N/A".to_string(),
+            };
+    
+            let regex = Regex::new(r"\d+$").unwrap();
+            let stripped_name = regex.replace(&name, "").to_string();
+            let type_var = man.worker_kind_env.get(&stripped_name);
+            let kind_str = match type_var {
+                Some(kind) => format!("{:?}", kind),
+                None => "Unknown".to_string(),
+            };
+    
+            curr_val_env.insert(
+                name.clone(),
+                format!("{}-{}-{}", val_str, kind_str, def_str),
+            );
+        }
+    
+        // Create response message
+        let reply_msg = Server2ClientMsg {
+            env: serde_json::to_string(&curr_val_env).unwrap(),
+            err: None,
+        };
+    
+        // Serialize to JSON
+        let reply_json = serde_json::to_string(&reply_msg).unwrap();
+    
+        // Send message to client over WebSocket
+        stream.send(Message::Text(reply_json)).await.unwrap();
+    }
     pub fn expr_to_string(expr: &Expr) -> String {
         match expr {
             Expr::IdExpr { ident } => {

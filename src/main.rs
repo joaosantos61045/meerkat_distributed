@@ -14,7 +14,7 @@ pub async fn main() {
         manager: manager::Manager::new(), 
     };
     runtime::repl::repl().await;
-    /*if let Err(e) = communication.process_remote().await {
+   /*  if let Err(e) = communication.process_remote().await {
         eprintln!("Error in WebSocket communication: {}", e);
     }*/
 }
