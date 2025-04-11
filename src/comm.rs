@@ -1,7 +1,7 @@
 use inline_colorization::*;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::{collections::HashMap, error::Error, collections::HashSet, net::SocketAddrV4};
+use std::{collections::{HashMap, HashSet}, error::Error, net::SocketAddrV4, vec};
 use regex::Regex;
 use tokio::{
     self,
@@ -119,11 +119,13 @@ impl Communication {
         let mut pub_access: HashMap<String, bool> = HashMap::new();
         let mut gen_fresh_meta = FreshMetaGenerator::new("default", 0);
         let mut gen_fresh_tyvar = FreshTyvarGenerator::new("default", 0);
+        let mut position: HashMap<String, Vec<f64>> = HashMap::new(); 
         let man = &mut self.manager;
         loop {
             tokio::select! {
                 Some(listener_msg) = rcvr.recv() => {
                     self.client_stream_map.insert(listener_msg.user_id, listener_msg.stream);
+                   
                 }
                 _ = time::sleep(Duration::from_millis(500)) => {
                   //  println!("Handle existing connections...");
@@ -140,9 +142,13 @@ impl Communication {
                                     Some(Ok(Message::Text(msg))) => {
                                         println!("Received from {id}: {msg}");
                                         let client_msg: Client2ServerMsg = serde_json::from_str(&msg).unwrap();
-                                       
-            
-                                        let command_ast = match repl_parser.parse(&client_msg.input) {
+                                        // var x=3;994.5/131.1875
+                                        let parts: Vec<&str> = client_msg.input.splitn(2, ';').collect();
+                                        let input = parts.get(0).unwrap_or(&"").trim(); // "var x=3"
+                                        let positions = parts.get(1).unwrap_or(&"").trim(); 
+                                        
+                                        
+                                        let command_ast = match repl_parser.parse(&input) {
                                             Ok(ast) => ast,
                                             Err(_) => {
                                                 let error_msg = Server2ClientMsg {
@@ -151,7 +157,7 @@ impl Communication {
                                                 };
                                                 let error_json = serde_json::to_string(&error_msg).unwrap();
                                                 stream.send(Message::Text(error_json)).await.unwrap();
-                                                Communication::send_environment_info(&mut *stream, man).await;
+                                                Communication::send_environment_info(&mut *stream, man, &position).await;
                                                 continue; 
                                             }
                                         };
@@ -176,7 +182,9 @@ impl Communication {
                                                             match decl {
                                                                 Decl::VarDecl { name, val } => {
                                                                     // Create code update for variable declaration
-                                                                    
+                                                                    let values: Vec<f64> = positions.split('/').filter_map(|v| v.trim().parse::<f64>().ok()).collect();
+                                                                    position.insert(name.clone(), values);
+                                                                    println!("Position: {:?}", position);
                                                                     let mut nodes_to_modify = HashSet::new();
                                                                     nodes_to_modify.insert(name.clone());
                             
@@ -197,6 +205,9 @@ impl Communication {
                                                                 }
                             
                                                                 Decl::DefDecl { name, val, .. } => {
+                                                                    let values: Vec<f64> = positions.split('/').filter_map(|v| v.trim().parse::<f64>().ok()).collect();
+                                                                    position.insert(name.clone(), values);
+                                                                    println!("Position: {:?}", position);
                                                                     let mut nodes_to_modify = HashSet::new();
                                                                     nodes_to_modify.insert(name.clone());
                             
@@ -277,7 +288,7 @@ impl Communication {
                                         }
                                        
             
-                                        Communication::send_environment_info(&mut *stream, man).await;
+                                        Communication::send_environment_info(&mut *stream, man,&position).await;
                                     }
                                     Some(Ok(_)) => {
                                         println!("Received non-text message from client {id}");
@@ -311,6 +322,7 @@ impl Communication {
     async fn send_environment_info(
         stream:  &mut WebSocketStream<tokio::net::TcpStream>,
         man: &Manager,
+        position: &HashMap<String, Vec<f64>>,
     ) {
         let mut curr_val_env: HashMap<String, String> = HashMap::new();
         let env_message = "Current Environment:".to_string();
@@ -343,10 +355,15 @@ impl Communication {
                 Some(kind) => format!("{:?}", kind),
                 None => "Unknown".to_string(),
             };
-    
+            let position_str = position
+                .get(stripped_name.as_str())
+                .filter(|v| v.len() == 2)
+                .map(|v| format!("{}/{}", v[0], v[1]))
+                .unwrap_or_else(|| "0/0".to_string());
+
             curr_val_env.insert(
                 name.clone(),
-                format!("{}-{}-{}", val_str, kind_str, def_str),
+                format!("{}-{}-{}-{}", val_str, kind_str, def_str,position_str),
             );
         }
     
